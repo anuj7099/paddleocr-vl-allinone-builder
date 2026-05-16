@@ -1,0 +1,220 @@
+name: Build PaddleOCR-VL All-in-One Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_OWNER: anuj7099
+  TAG: dev
+  PLATFORM: linux/amd64
+  PADDLEOCR_REPO: https://github.com/PaddlePaddle/PaddleOCR.git
+  PADDLEOCR_BRANCH: main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          echo "Disk before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo docker system prune -af || true
+          echo "Disk after cleanup:"
+          df -h
+
+      - name: Checkout PaddleOCR
+        run: |
+          git clone --depth 1 --branch "${PADDLEOCR_BRANCH}" "${PADDLEOCR_REPO}" PaddleOCR
+
+      - name: Locate compose folder
+        run: |
+          echo "Checking expected HPS path..."
+          if [ -d "PaddleOCR/deploy/paddleocr_vl_docker/hps" ]; then
+            echo "COMPOSE_DIR=PaddleOCR/deploy/paddleocr_vl_docker/hps" >> $GITHUB_ENV
+          elif [ -d "PaddleOCR/deploy/paddleocr_vl_docker/accelerators/nvidia-gpu" ]; then
+            echo "COMPOSE_DIR=PaddleOCR/deploy/paddleocr_vl_docker/accelerators/nvidia-gpu" >> $GITHUB_ENV
+          else
+            echo "Could not find compose folder. Available compose files:"
+            find PaddleOCR/deploy/paddleocr_vl_docker -name "compose.yaml" -print || true
+            exit 1
+          fi
+
+      - name: Prepare PaddleOCR HPS files
+        run: |
+          cd "$COMPOSE_DIR"
+          if [ -f prepare.sh ]; then
+            bash prepare.sh
+          else
+            echo "prepare.sh not found, skipping."
+          fi
+          ls -la
+
+      - name: Create all-in-one files
+        run: |
+          cd "$COMPOSE_DIR"
+
+          cat > start-all.sh <<'EOF'
+          #!/bin/bash
+          set -e
+
+          mkdir -p /workspace/models/huggingface
+          mkdir -p /workspace/models/paddle
+          mkdir -p /workspace/models/paddleocr
+          mkdir -p /workspace/models/paddlex
+          mkdir -p /workspace/models/vllm
+
+          mkdir -p /workspace/ocr-data/uploads
+          mkdir -p /workspace/ocr-data/outputs
+          mkdir -p /workspace/ocr-data/logs
+          mkdir -p /workspace/logs
+
+          export HF_HOME=/workspace/models/huggingface
+          export TRANSFORMERS_CACHE=/workspace/models/huggingface
+          export HUGGINGFACE_HUB_CACHE=/workspace/models/huggingface/hub
+          export PADDLE_HOME=/workspace/models/paddle
+          export PADDLEOCR_HOME=/workspace/models/paddleocr
+          export PADDLEX_HOME=/workspace/models/paddlex
+          export VLLM_CACHE_ROOT=/workspace/models/vllm
+
+          exec supervisord -c /etc/supervisor/conf.d/supervisord.conf
+          EOF
+
+          chmod +x start-all.sh
+
+          cat > supervisord.conf <<'EOF'
+          [supervisord]
+          nodaemon=true
+          logfile=/workspace/logs/supervisord.log
+          pidfile=/tmp/supervisord.pid
+
+          [program:vlm-server]
+          command=paddleocr genai_server --model_name PaddleOCR-VL-1.5-0.9B --host 0.0.0.0 --port 8081 --backend vllm
+          directory=/workspace
+          autostart=true
+          autorestart=true
+          startsecs=30
+          stdout_logfile=/workspace/logs/vlm-server.out.log
+          stderr_logfile=/workspace/logs/vlm-server.err.log
+
+          [program:tritonserver]
+          command=tritonserver --model-repository=/workspace/triton-model-repository --http-port=8000 --grpc-port=8001 --metrics-port=8002
+          directory=/workspace
+          autostart=true
+          autorestart=true
+          startsecs=30
+          stdout_logfile=/workspace/logs/tritonserver.out.log
+          stderr_logfile=/workspace/logs/tritonserver.err.log
+
+          [program:gateway-api]
+          command=uvicorn main:app --host 0.0.0.0 --port 8080 --workers 1
+          directory=/workspace/gateway
+          autostart=true
+          autorestart=true
+          startsecs=30
+          environment=HPS_TRITON_URL="localhost:8001",HPS_VLM_URL="http://localhost:8081",HPS_MAX_CONCURRENT_INFERENCE_REQUESTS="4",HPS_MAX_CONCURRENT_NON_INFERENCE_REQUESTS="16",HPS_INFERENCE_TIMEOUT="600",HPS_LOG_LEVEL="INFO",UVICORN_WORKERS="1"
+          stdout_logfile=/workspace/logs/gateway-api.out.log
+          stderr_logfile=/workspace/logs/gateway-api.err.log
+          EOF
+
+          cat > Dockerfile.allinone <<'EOF'
+          FROM ghcr.io/blender-anuj/paddleocr-vlm-server:dev AS vlm_image
+          FROM ghcr.io/blender-anuj/paddleocr-vl-api:dev AS api_image
+          FROM ghcr.io/blender-anuj/paddleocr-vl-tritonserver:dev AS triton_image
+
+          FROM ghcr.io/blender-anuj/paddleocr-vlm-server:dev
+
+          WORKDIR /workspace
+
+          ENV DEBIAN_FRONTEND=noninteractive
+          ENV PYTHONUNBUFFERED=1
+          ENV PATH="/opt/tritonserver/bin:${PATH}"
+
+          RUN apt-get update && apt-get install -y \
+              curl \
+              supervisor \
+              findutils \
+              && rm -rf /var/lib/apt/lists/*
+
+          COPY --from=api_image /app /workspace/gateway
+
+          COPY --from=triton_image /opt/tritonserver /opt/tritonserver
+          COPY --from=triton_image /models /workspace/triton-model-repository
+
+          COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+          COPY start-all.sh /workspace/start-all.sh
+
+          RUN chmod +x /workspace/start-all.sh
+
+          EXPOSE 8080 8081 8000 8001 8002
+
+          CMD ["/workspace/start-all.sh"]
+          EOF
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ env.GHCR_OWNER }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.COMPOSE_DIR }}
+          file: ${{ env.COMPOSE_DIR }}/gateway.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-api:${{ env.TAG }}
+          cache-from: type=gha,scope=paddleocr-vl-api
+          cache-to: type=gha,mode=max,scope=paddleocr-vl-api
+
+      - name: Build and push Triton image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.COMPOSE_DIR }}
+          file: ${{ env.COMPOSE_DIR }}/tritonserver.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-tritonserver:${{ env.TAG }}
+          cache-from: type=gha,scope=paddleocr-vl-tritonserver
+          cache-to: type=gha,mode=max,scope=paddleocr-vl-tritonserver
+
+      - name: Mirror VLM image to GHCR
+        run: |
+          docker pull --platform "${PLATFORM}" ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
+          docker tag ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+          docker push ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+
+      - name: Build and push all-in-one image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.COMPOSE_DIR }}
+          file: ${{ env.COMPOSE_DIR }}/Dockerfile.allinone
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-allinone:${{ env.TAG }}
+          cache-from: type=gha,scope=paddleocr-vl-allinone
+          cache-to: type=gha,mode=max,scope=paddleocr-vl-allinone
+
+      - name: Final image
+        run: |
+          echo "Final all-in-one image:"
+          echo "ghcr.io/${GHCR_OWNER}/paddleocr-vl-allinone:${TAG}"
