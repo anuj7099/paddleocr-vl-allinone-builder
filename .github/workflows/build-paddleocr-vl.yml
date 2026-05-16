@@ -2,6 +2,15 @@ name: Build PaddleOCR-VL All-in-One Image
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild_base_images:
+        description: "Rebuild API, Triton, and VLM images"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
     branches:
       - main
@@ -82,6 +91,7 @@ jobs:
           password: ${{ secrets.GHCR_PAT }}
 
       - name: Build and push API image
+        if: github.event_name == 'push' || github.event.inputs.rebuild_base_images == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.COMPOSE_DIR }}
@@ -91,6 +101,7 @@ jobs:
           tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-api:${{ env.TAG }}
 
       - name: Build and push Triton image
+        if: github.event_name == 'push' || github.event.inputs.rebuild_base_images == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.COMPOSE_DIR }}
@@ -100,6 +111,7 @@ jobs:
           tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-tritonserver:${{ env.TAG }}
 
       - name: Mirror VLM image to GHCR
+        if: github.event_name == 'push' || github.event.inputs.rebuild_base_images == 'true'
         run: |
           docker pull --platform "${PLATFORM}" ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
 
@@ -109,12 +121,15 @@ jobs:
 
           docker push ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
 
-      - name: Inspect API and Triton image paths
+      - name: Pull base images for all-in-one
         run: |
-          echo "Pulling images for inspection..."
+          echo "Pulling base images..."
           docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG}
           docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG}
+          docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
 
+      - name: Inspect API and Triton image paths
+        run: |
           echo "Inspecting API image..."
           docker run --rm --platform "${PLATFORM}" --entrypoint sh \
             ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG} \
@@ -130,6 +145,9 @@ jobs:
 
               echo "Find requirements.txt:";
               find / -name "requirements.txt" 2>/dev/null | head -20 || true;
+
+              echo "Python site packages:";
+              python -c "import site; print(site.getsitepackages())" || true;
             '
 
           echo "Inspecting Triton image..."
@@ -147,6 +165,9 @@ jobs:
 
               echo "Find config.pbtxt:";
               find / -name "config.pbtxt" 2>/dev/null | head -80 || true;
+
+              echo "Find important libs:";
+              find /usr/lib /usr/local /opt -name "libb64.so*" -o -name "libssl.so.1.1" -o -name "libcrypto.so.1.1" -o -name "libdcgm.so.3" -o -name "libre2.so*" 2>/dev/null | head -100 || true;
             '
 
           echo "Detecting Triton model repository path..."
@@ -203,6 +224,7 @@ jobs:
           export PADDLEOCR_HOME=/workspace/models/paddleocr
           export PADDLEX_HOME=/workspace/models/paddlex
           export VLLM_CACHE_ROOT=/workspace/models/vllm
+          export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
           exec supervisord -c /etc/supervisor/conf.d/supervisord.conf
           EOF
@@ -212,6 +234,7 @@ jobs:
           cat > supervisord.conf <<'EOF'
           [supervisord]
           nodaemon=true
+          user=root
           logfile=/workspace/logs/supervisord.log
           pidfile=/tmp/supervisord.pid
 
@@ -225,7 +248,7 @@ jobs:
           stderr_logfile=/workspace/logs/vlm-server.err.log
 
           [program:tritonserver]
-          command=tritonserver --model-repository=/workspace/triton-model-repository --backend-config=python,shm-default-byte-size=104857600,shm-growth-byte-size=10485760 --http-port=8000 --grpc-port=8001 --metrics-port=8002 --log-info=1 --log-warning=1 --log-error=1
+          command=/opt/tritonserver/bin/tritonserver --model-repository=/workspace/triton-model-repository --backend-config=python,shm-default-byte-size=104857600,shm-growth-byte-size=10485760 --http-port=8000 --grpc-port=8001 --metrics-port=8002 --log-info=1 --log-warning=1 --log-error=1
           directory=/workspace
           autostart=true
           autorestart=true
@@ -234,12 +257,12 @@ jobs:
           stderr_logfile=/workspace/logs/tritonserver.err.log
 
           [program:gateway-api]
-          command=uvicorn main:app --host 0.0.0.0 --port 8080 --workers 1
+          command=sh -lc 'echo "Waiting for Triton and VLM..."; until curl -f http://localhost:8000/v2/health/ready; do sleep 5; done; until curl -f http://localhost:8081/health; do sleep 5; done; cd /workspace/gateway && uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1'
           directory=/workspace/gateway
           autostart=true
           autorestart=true
           startsecs=30
-          environment=HPS_TRITON_URL="localhost:8001",HPS_VLM_URL="http://localhost:8081",HPS_MAX_CONCURRENT_INFERENCE_REQUESTS="4",HPS_MAX_CONCURRENT_NON_INFERENCE_REQUESTS="16",HPS_INFERENCE_TIMEOUT="600",HPS_LOG_LEVEL="INFO",UVICORN_WORKERS="1"
+          environment=HPS_TRITON_URL="localhost:8001",HPS_VLM_URL="http://localhost:8081",HPS_MAX_CONCURRENT_INFERENCE_REQUESTS="4",HPS_MAX_CONCURRENT_NON_INFERENCE_REQUESTS="16",HPS_INFERENCE_TIMEOUT="600",HPS_LOG_LEVEL="INFO",UVICORN_WORKERS="1",PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="True"
           stdout_logfile=/workspace/logs/gateway-api.out.log
           stderr_logfile=/workspace/logs/gateway-api.err.log
           EOF
@@ -258,6 +281,7 @@ jobs:
           ENV DEBIAN_FRONTEND=noninteractive
           ENV PYTHONUNBUFFERED=1
           ENV PATH="/opt/tritonserver/bin:\${PATH}"
+          ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
           RUN mkdir -p /var/lib/apt/lists/partial && \
               apt-get update && apt-get install -y \
@@ -266,11 +290,22 @@ jobs:
               findutils \
               && rm -rf /var/lib/apt/lists/*
 
+          # Gateway app from API image
           COPY --from=api_image /app /workspace/gateway
 
+          # API Python dependencies, including PaddleX serving plugin
+          COPY --from=api_image /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+
+          # Triton runtime
           COPY --from=triton_image /opt/tritonserver /opt/tritonserver
 
+          # Triton model repository
           COPY --from=triton_image ${TRITON_REPO_DIR} /workspace/triton-model-repository
+
+          # Triton runtime libraries required by /opt/tritonserver/bin/tritonserver
+          COPY --from=triton_image /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
+
+          RUN ldconfig
 
           COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
           COPY start-all.sh /workspace/start-all.sh
