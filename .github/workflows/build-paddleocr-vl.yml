@@ -30,10 +30,13 @@ jobs:
         run: |
           echo "Disk before cleanup:"
           df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/lib/android
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo docker system prune -af || true
+
           echo "Disk after cleanup:"
           df -h
 
@@ -44,6 +47,7 @@ jobs:
       - name: Locate compose folder
         run: |
           echo "Checking expected HPS path..."
+
           if [ -d "PaddleOCR/deploy/paddleocr_vl_docker/hps" ]; then
             echo "COMPOSE_DIR=PaddleOCR/deploy/paddleocr_vl_docker/hps" >> $GITHUB_ENV
           elif [ -d "PaddleOCR/deploy/paddleocr_vl_docker/accelerators/nvidia-gpu" ]; then
@@ -57,11 +61,14 @@ jobs:
       - name: Prepare PaddleOCR HPS files
         run: |
           cd "$COMPOSE_DIR"
+
           if [ -f prepare.sh ]; then
             bash prepare.sh
           else
             echo "prepare.sh not found, skipping."
           fi
+
+          echo "Files in compose directory:"
           ls -la
 
       - name: Create all-in-one files
@@ -132,11 +139,11 @@ jobs:
           EOF
 
           cat > Dockerfile.allinone <<'EOF'
-          FROM ghcr.io/blender-anuj/paddleocr-vlm-server:dev AS vlm_image
-          FROM ghcr.io/blender-anuj/paddleocr-vl-api:dev AS api_image
-          FROM ghcr.io/blender-anuj/paddleocr-vl-tritonserver:dev AS triton_image
+          FROM ghcr.io/anuj7099/paddleocr-vlm-server:dev AS vlm_image
+          FROM ghcr.io/anuj7099/paddleocr-vl-api:dev AS api_image
+          FROM ghcr.io/anuj7099/paddleocr-vl-tritonserver:dev AS triton_image
 
-          FROM ghcr.io/blender-anuj/paddleocr-vlm-server:dev
+          FROM ghcr.io/anuj7099/paddleocr-vlm-server:dev
 
           WORKDIR /workspace
 
@@ -172,8 +179,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ env.GHCR_OWNER }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: anuj7099
+          password: ${{ secrets.GHCR_PAT }}
 
       - name: Build and push API image
         uses: docker/build-push-action@v6
@@ -200,7 +207,11 @@ jobs:
       - name: Mirror VLM image to GHCR
         run: |
           docker pull --platform "${PLATFORM}" ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
-          docker tag ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+
+          docker tag \
+            ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu \
+            ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+
           docker push ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
 
       - name: Build and push all-in-one image
