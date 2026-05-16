@@ -71,9 +71,115 @@ jobs:
           echo "Files in compose directory:"
           ls -la
 
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: anuj7099
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.COMPOSE_DIR }}
+          file: ${{ env.COMPOSE_DIR }}/gateway.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-api:${{ env.TAG }}
+
+      - name: Build and push Triton image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.COMPOSE_DIR }}
+          file: ${{ env.COMPOSE_DIR }}/tritonserver.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-tritonserver:${{ env.TAG }}
+
+      - name: Mirror VLM image to GHCR
+        run: |
+          docker pull --platform "${PLATFORM}" ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
+
+          docker tag \
+            ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu \
+            ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+
+          docker push ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+
+      - name: Inspect API and Triton image paths
+        run: |
+          echo "Pulling images for inspection..."
+          docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG}
+          docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG}
+
+          echo "Inspecting API image..."
+          docker run --rm --platform "${PLATFORM}" --entrypoint sh \
+            ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG} \
+            -lc '
+              echo "Root:";
+              ls -la / || true;
+
+              echo "Find main.py:";
+              find / -name "main.py" 2>/dev/null | head -20 || true;
+
+              echo "Find app.py:";
+              find / -name "app.py" 2>/dev/null | head -20 || true;
+
+              echo "Find requirements.txt:";
+              find / -name "requirements.txt" 2>/dev/null | head -20 || true;
+            '
+
+          echo "Inspecting Triton image..."
+          docker run --rm --platform "${PLATFORM}" --entrypoint sh \
+            ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG} \
+            -lc '
+              echo "Root:";
+              ls -la / || true;
+
+              echo "Find tritonserver:";
+              which tritonserver || true;
+              ls -la /opt || true;
+              ls -la /opt/tritonserver || true;
+              ls -la /opt/tritonserver/bin || true;
+
+              echo "Find config.pbtxt:";
+              find / -name "config.pbtxt" 2>/dev/null | head -80 || true;
+            '
+
+          echo "Detecting Triton model repository path..."
+
+          TRITON_REPO_DIR=$(docker run --rm --platform "${PLATFORM}" --entrypoint sh \
+            ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG} \
+            -lc '
+              FIRST_CONFIG=$(find / -name "config.pbtxt" 2>/dev/null | head -1)
+
+              if [ -z "$FIRST_CONFIG" ]; then
+                echo ""
+                exit 0
+              fi
+
+              MODEL_DIR=$(dirname "$FIRST_CONFIG")
+              REPO_DIR=$(dirname "$MODEL_DIR")
+              echo "$REPO_DIR"
+            ')
+
+          if [ -z "$TRITON_REPO_DIR" ]; then
+            echo "ERROR: Could not auto-detect Triton model repository path."
+            echo "The Triton image may generate/download models at runtime instead of storing config.pbtxt in the image."
+            exit 1
+          fi
+
+          echo "Detected Triton model repository path: $TRITON_REPO_DIR"
+          echo "TRITON_REPO_DIR=$TRITON_REPO_DIR" >> $GITHUB_ENV
+
       - name: Create all-in-one files
         run: |
           cd "$COMPOSE_DIR"
+
+          echo "Using Triton repo path: $TRITON_REPO_DIR"
 
           cat > start-all.sh <<'EOF'
           #!/bin/bash
@@ -119,7 +225,7 @@ jobs:
           stderr_logfile=/workspace/logs/vlm-server.err.log
 
           [program:tritonserver]
-          command=sh -lc 'echo "Searching Triton model repository..."; find /workspace/triton-image-workspace -name "config.pbtxt" -print | head -50; FIRST_CONFIG=$(find /workspace/triton-image-workspace -name "config.pbtxt" | head -1); if [ -z "$FIRST_CONFIG" ]; then echo "No config.pbtxt found"; exit 1; fi; MODEL_DIR=$(dirname "$FIRST_CONFIG"); REPO_DIR=$(dirname "$MODEL_DIR"); echo "Using Triton model repository: $REPO_DIR"; tritonserver --model-repository="$REPO_DIR" --http-port=8000 --grpc-port=8001 --metrics-port=8002'
+          command=tritonserver --model-repository=/workspace/triton-model-repository --http-port=8000 --grpc-port=8001 --metrics-port=8002
           directory=/workspace
           autostart=true
           autorestart=true
@@ -138,18 +244,18 @@ jobs:
           stderr_logfile=/workspace/logs/gateway-api.err.log
           EOF
 
-          cat > Dockerfile.allinone <<'EOF'
-          FROM ghcr.io/anuj7099/paddleocr-vlm-server:dev AS vlm_image
-          FROM ghcr.io/anuj7099/paddleocr-vl-api:dev AS api_image
-          FROM ghcr.io/anuj7099/paddleocr-vl-tritonserver:dev AS triton_image
+          cat > Dockerfile.allinone <<EOF
+          FROM ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG} AS vlm_image
+          FROM ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG} AS api_image
+          FROM ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG} AS triton_image
 
-          FROM ghcr.io/anuj7099/paddleocr-vlm-server:dev
+          FROM ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
 
           WORKDIR /workspace
 
           ENV DEBIAN_FRONTEND=noninteractive
           ENV PYTHONUNBUFFERED=1
-          ENV PATH="/opt/tritonserver/bin:${PATH}"
+          ENV PATH="/opt/tritonserver/bin:\${PATH}"
 
           RUN apt-get update && apt-get install -y \
               curl \
@@ -161,9 +267,7 @@ jobs:
 
           COPY --from=triton_image /opt/tritonserver /opt/tritonserver
 
-          # The Triton image does not have /models.
-          # Copy its /workspace and dynamically locate config.pbtxt at runtime.
-          COPY --from=triton_image /workspace /workspace/triton-image-workspace
+          COPY --from=triton_image ${TRITON_REPO_DIR} /workspace/triton-model-repository
 
           COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
           COPY start-all.sh /workspace/start-all.sh
@@ -175,43 +279,8 @@ jobs:
           CMD ["/workspace/start-all.sh"]
           EOF
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: anuj7099
-          password: ${{ secrets.GHCR_PAT }}
-
-      - name: Build and push API image
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ env.COMPOSE_DIR }}
-          file: ${{ env.COMPOSE_DIR }}/gateway.Dockerfile
-          platforms: ${{ env.PLATFORM }}
-          push: true
-          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-api:${{ env.TAG }}
-
-      - name: Build and push Triton image
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ env.COMPOSE_DIR }}
-          file: ${{ env.COMPOSE_DIR }}/tritonserver.Dockerfile
-          platforms: ${{ env.PLATFORM }}
-          push: true
-          tags: ghcr.io/${{ env.GHCR_OWNER }}/paddleocr-vl-tritonserver:${{ env.TAG }}
-
-      - name: Mirror VLM image to GHCR
-        run: |
-          docker pull --platform "${PLATFORM}" ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
-
-          docker tag \
-            ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu \
-            ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
-
-          docker push ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
+          echo "Generated Dockerfile.allinone:"
+          cat Dockerfile.allinone
 
       - name: Build and push all-in-one image
         uses: docker/build-push-action@v6
