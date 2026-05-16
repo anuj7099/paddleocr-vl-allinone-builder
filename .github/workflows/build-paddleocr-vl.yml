@@ -167,7 +167,14 @@ jobs:
               find / -name "config.pbtxt" 2>/dev/null | head -80 || true;
 
               echo "Find important libs:";
-              find /usr/lib /usr/local /opt -name "libb64.so*" -o -name "libssl.so.1.1" -o -name "libcrypto.so.1.1" -o -name "libdcgm.so.3" -o -name "libre2.so*" 2>/dev/null | head -100 || true;
+              find /usr/lib /usr/local /opt \
+                \( -name "libb64.so*" \
+                -o -name "libssl.so.1.1" \
+                -o -name "libcrypto.so.1.1" \
+                -o -name "libdcgm.so.3" \
+                -o -name "libre2.so.5" \
+                -o -name "libre2.so*" \) \
+                2>/dev/null | head -100 || true;
             '
 
           echo "Detecting Triton model repository path..."
@@ -248,7 +255,7 @@ jobs:
           stderr_logfile=/workspace/logs/vlm-server.err.log
 
           [program:tritonserver]
-          command=/opt/tritonserver/bin/tritonserver --model-repository=/workspace/triton-model-repository --backend-config=python,shm-default-byte-size=104857600,shm-growth-byte-size=10485760 --http-port=8000 --grpc-port=8001 --metrics-port=8002 --log-info=1 --log-warning=1 --log-error=1
+          command=/bin/bash -lc 'export LD_LIBRARY_PATH=/opt/triton-compat-libs:/opt/tritonserver/lib:/opt/tritonserver/backends/python:$LD_LIBRARY_PATH; /opt/tritonserver/bin/tritonserver --model-repository=/workspace/triton-model-repository --backend-config=python,shm-default-byte-size=104857600,shm-growth-byte-size=10485760 --http-port=8000 --grpc-port=8001 --metrics-port=8002 --log-info=1 --log-warning=1 --log-error=1'
           directory=/workspace
           autostart=true
           autorestart=true
@@ -302,10 +309,17 @@ jobs:
           # Triton model repository
           COPY --from=triton_image ${TRITON_REPO_DIR} /workspace/triton-model-repository
 
-          # Triton runtime libraries required by /opt/tritonserver/bin/tritonserver
-          COPY --from=triton_image /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
+          # Triton compatibility libraries.
+          # Do NOT overwrite /usr/lib/x86_64-linux-gnu, because that can break GLIBC in the VLM base image.
+          RUN mkdir -p /opt/triton-compat-libs
 
-          RUN ldconfig
+          COPY --from=triton_image /usr/lib/x86_64-linux-gnu/libb64.so.0d /opt/triton-compat-libs/
+          COPY --from=triton_image /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /opt/triton-compat-libs/
+          COPY --from=triton_image /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /opt/triton-compat-libs/
+          COPY --from=triton_image /usr/lib/x86_64-linux-gnu/libre2.so.5 /opt/triton-compat-libs/
+
+          # libdcgm may be under /usr/lib/x86_64-linux-gnu in the Triton image.
+          COPY --from=triton_image /usr/lib/x86_64-linux-gnu/libdcgm.so.3 /opt/triton-compat-libs/
 
           COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
           COPY start-all.sh /workspace/start-all.sh
