@@ -127,33 +127,35 @@ jobs:
           docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG}
           docker pull --platform "${PLATFORM}" ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG}
 
-      - name: Inspect API and Triton image paths
+      - name: Set Triton model repository path
         run: |
-          echo "Inspecting API image..."
+          echo "Using fixed Triton model repo path from upstream tritonserver.Dockerfile"
+          echo "TRITON_REPO_DIR=/app/model_repo" >> "$GITHUB_ENV"
+
+      - name: Sanity check base images
+        run: |
+          echo "Checking API image..."
           docker run --rm --platform "${PLATFORM}" --entrypoint sh \
             ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG} \
             -lc '
-              echo "Root:";
-              ls -la / || true;
-
+              echo "API image /app:";
+              ls -la /app || true;
               echo "Find app.py:";
-              find / -name "app.py" 2>/dev/null | head -20 || true;
-
+              find /app -name "app.py" 2>/dev/null | head -20 || true;
               echo "Python site packages:";
               python -c "import site; print(site.getsitepackages())" || true;
             '
 
-          echo "Inspecting Triton image..."
+          echo "Checking Triton image..."
           docker run --rm --platform "${PLATFORM}" --entrypoint sh \
             ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG} \
             -lc '
+              echo "Triton image /app/model_repo:";
+              ls -la /app/model_repo || true;
+              echo "Find model configs:";
+              find /app/model_repo -maxdepth 3 -type f \( -name "config.pbtxt" -o -name "config_gpu.pbtxt" -o -name "config_cpu.pbtxt" \) -print || true;
               echo "Find tritonserver:";
-              which tritonserver || true;
-              ls -la /opt/tritonserver/bin || true;
-
-              echo "Find config.pbtxt:";
-              find / -name "config.pbtxt" 2>/dev/null | head -80 || true;
-
+              ls -la /opt/tritonserver/bin/tritonserver || true;
               echo "Find important libs:";
               find /usr/lib /usr/local /opt \
                 \( -name "libb64.so*" \
@@ -164,31 +166,6 @@ jobs:
                 -o -name "libcudart.so.11.0" \) \
                 2>/dev/null | head -100 || true;
             '
-
-          echo "Detecting Triton model repository path..."
-
-          TRITON_REPO_DIR=$(docker run --rm --platform "${PLATFORM}" --entrypoint sh \
-            ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG} \
-            -lc '
-              FIRST_CONFIG=$(find / -name "config.pbtxt" 2>/dev/null | head -1)
-
-              if [ -z "$FIRST_CONFIG" ]; then
-                echo ""
-                exit 0
-              fi
-
-              MODEL_DIR=$(dirname "$FIRST_CONFIG")
-              REPO_DIR=$(dirname "$MODEL_DIR")
-              echo "$REPO_DIR"
-            ')
-
-          if [ -z "$TRITON_REPO_DIR" ]; then
-            echo "ERROR: Could not auto-detect Triton model repository path."
-            exit 1
-          fi
-
-          echo "Detected Triton model repository path: $TRITON_REPO_DIR"
-          echo "TRITON_REPO_DIR=$TRITON_REPO_DIR" >> $GITHUB_ENV
 
       - name: Create all-in-one files
         run: |
@@ -218,6 +195,7 @@ jobs:
           export PADDLEX_HOME=/workspace/models/paddlex
           export VLLM_CACHE_ROOT=/workspace/models/vllm
           export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+          export PADDLEX_HPS_DEVICE_TYPE=gpu
 
           exec supervisord -c /etc/supervisor/conf.d/supervisord.conf
           EOF
@@ -255,7 +233,7 @@ jobs:
           autostart=true
           autorestart=true
           startsecs=30
-          environment=HPS_TRITON_URL="localhost:8001",HPS_VLM_URL="http://localhost:8081",HPS_MAX_CONCURRENT_INFERENCE_REQUESTS="4",HPS_MAX_CONCURRENT_NON_INFERENCE_REQUESTS="16",HPS_INFERENCE_TIMEOUT="600",HPS_LOG_LEVEL="INFO",UVICORN_WORKERS="1",PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="True"
+          environment=HPS_TRITON_URL="localhost:8001",HPS_VLM_URL="http://localhost:8081",HPS_MAX_CONCURRENT_INFERENCE_REQUESTS="4",HPS_MAX_CONCURRENT_NON_INFERENCE_REQUESTS="16",HPS_INFERENCE_TIMEOUT="600",HPS_LOG_LEVEL="INFO",UVICORN_WORKERS="1",PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="True",PADDLEX_HPS_DEVICE_TYPE="gpu"
           stdout_logfile=/workspace/logs/gateway-api.out.log
           stderr_logfile=/workspace/logs/gateway-api.err.log
           EOF
@@ -275,6 +253,7 @@ jobs:
           ENV PYTHONUNBUFFERED=1
           ENV PATH="/opt/tritonserver/bin:\${PATH}"
           ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+          ENV PADDLEX_HPS_DEVICE_TYPE=gpu
 
           RUN mkdir -p /var/lib/apt/lists/partial && \
               apt-get update && apt-get install -y \
@@ -290,22 +269,28 @@ jobs:
           # API Python dependencies, including PaddleX serving plugin.
           COPY --from=api_image /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 
-          # Repair VLM-compatible dependency after copying API deps.
+          # Repair VLM-compatible dependencies after copying API deps.
           RUN pip install --no-cache-dir --upgrade "huggingface-hub>=0.34.0,<1.0" && \
               pip install --no-cache-dir --force-reinstall "PyYAML==6.0.2"
 
           # Triton runtime.
           COPY --from=triton_image /opt/tritonserver /opt/tritonserver
 
-          # Triton model repository.
-          COPY --from=triton_image ${TRITON_REPO_DIR} /workspace/triton-model-repository
+          # Deterministic model repo path from PaddleOCR HPS tritonserver.Dockerfile.
+          COPY --from=triton_image /app/model_repo /workspace/triton-model-repository
 
-          # PaddleOCR HPS model repo has config_gpu.pbtxt/config_cpu.pbtxt for layout-parsing.
-          # Triton expects config.pbtxt, so use GPU config.
-          RUN if [ -f /workspace/triton-model-repository/layout-parsing/config_gpu.pbtxt ]; then \
-                cp /workspace/triton-model-repository/layout-parsing/config_gpu.pbtxt \
-                   /workspace/triton-model-repository/layout-parsing/config.pbtxt; \
-              fi
+          # Match upstream server.sh:
+          # for every model dir, if config.pbtxt is missing, promote config_gpu.pbtxt to config.pbtxt.
+          RUN for dir in /workspace/triton-model-repository/*/ ; do \
+                [ -d "\$dir" ] || continue ; \
+                if [ ! -f "\${dir}/config.pbtxt" ]; then \
+                  if [ "\${PADDLEX_HPS_DEVICE_TYPE:-gpu}" = "gpu" ] && [ -f "\${dir}/config_gpu.pbtxt" ]; then \
+                    cp -f "\${dir}/config_gpu.pbtxt" "\${dir}/config.pbtxt"; \
+                  elif [ -f "\${dir}/config_cpu.pbtxt" ]; then \
+                    cp -f "\${dir}/config_cpu.pbtxt" "\${dir}/config.pbtxt"; \
+                  fi; \
+                fi; \
+              done
 
           # Triton compatibility libraries.
           # Never overwrite /usr/lib/x86_64-linux-gnu because it can break GLIBC.
