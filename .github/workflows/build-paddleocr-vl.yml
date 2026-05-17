@@ -152,10 +152,18 @@ jobs:
             -lc '
               echo "Triton image /app/model_repo:";
               ls -la /app/model_repo || true;
+
               echo "Find model configs:";
-              find /app/model_repo -maxdepth 3 -type f \( -name "config.pbtxt" -o -name "config_gpu.pbtxt" -o -name "config_cpu.pbtxt" \) -print || true;
+              find /app/model_repo -maxdepth 3 -type f \
+                \( -name "config.pbtxt" -o -name "config_gpu.pbtxt" -o -name "config_cpu.pbtxt" \) \
+                -print || true;
+
               echo "Find tritonserver:";
               ls -la /opt/tritonserver/bin/tritonserver || true;
+
+              echo "Find paddlex_hps_server:";
+              find / -type d -name "paddlex_hps_server" 2>/dev/null || true;
+
               echo "Find important libs:";
               find /usr/lib /usr/local /opt \
                 \( -name "libb64.so*" \
@@ -219,7 +227,7 @@ jobs:
           stderr_logfile=/workspace/logs/vlm-server.err.log
 
           [program:tritonserver]
-          command=/bin/bash -lc 'export LD_LIBRARY_PATH=/opt/triton-compat-libs:/opt/tritonserver/lib:/opt/tritonserver/backends/python:$LD_LIBRARY_PATH; /opt/tritonserver/bin/tritonserver --model-repository=/workspace/triton-model-repository --backend-config=python,shm-default-byte-size=104857600,shm-growth-byte-size=10485760 --http-port=8000 --grpc-port=8001 --metrics-port=8002 --log-info=1 --log-warning=1 --log-error=1'
+          command=/bin/bash -lc 'export LD_LIBRARY_PATH=/opt/triton-compat-libs:/opt/tritonserver/lib:/opt/tritonserver/backends/python:$LD_LIBRARY_PATH; export PYTHONPATH=/usr/local/lib/python3.10/site-packages:$PYTHONPATH; /opt/tritonserver/bin/tritonserver --model-repository=/workspace/triton-model-repository --backend-config=python,shm-default-byte-size=104857600,shm-growth-byte-size=10485760 --http-port=8000 --grpc-port=8001 --metrics-port=8002 --log-info=1 --log-warning=1 --log-error=1'
           directory=/workspace
           autostart=true
           autorestart=true
@@ -239,6 +247,8 @@ jobs:
           EOF
 
           cat > Dockerfile.allinone <<EOF
+          # syntax=docker/dockerfile:1.4
+
           FROM ghcr.io/${GHCR_OWNER}/paddleocr-vlm-server:${TAG} AS vlm_image
           FROM ghcr.io/${GHCR_OWNER}/paddleocr-vl-api:${TAG} AS api_image
           FROM ghcr.io/${GHCR_OWNER}/paddleocr-vl-tritonserver:${TAG} AS triton_image
@@ -257,6 +267,7 @@ jobs:
 
           RUN mkdir -p /var/lib/apt/lists/partial && \
               apt-get update && apt-get install -y \
+              bash \
               curl \
               supervisor \
               findutils \
@@ -269,6 +280,32 @@ jobs:
           # API Python dependencies, including PaddleX serving plugin.
           COPY --from=api_image /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 
+          # Triton model.py imports paddlex_hps_server.
+          # This package comes from the HPS/Triton image, not from public PyPI.
+          RUN mkdir -p /usr/local/lib/python3.10/site-packages
+
+          RUN --mount=type=bind,from=triton_image,source=/usr/local/lib/python3.10/site-packages,target=/mnt/tsp \
+              bash -euxo pipefail -c '\
+                if [ -d /mnt/tsp/paddlex_hps_server ]; then \
+                  cp -a /mnt/tsp/paddlex_hps_server /usr/local/lib/python3.10/site-packages/; \
+                  shopt -s nullglob; \
+                  for d in /mnt/tsp/paddlex_hps_server-*.dist-info; do \
+                    cp -a "$d" /usr/local/lib/python3.10/site-packages/; \
+                  done; \
+                fi'
+
+          # Some builds may use dist-packages instead of site-packages.
+          RUN --mount=type=bind,from=triton_image,source=/usr/local/lib/python3.10/dist-packages,target=/mnt/tdp \
+              bash -euxo pipefail -c '\
+                [ -d /mnt/tdp ] || exit 0; \
+                if [ -d /mnt/tdp/paddlex_hps_server ]; then \
+                  cp -a /mnt/tdp/paddlex_hps_server /usr/local/lib/python3.10/site-packages/; \
+                  shopt -s nullglob; \
+                  for d in /mnt/tdp/paddlex_hps_server-*.dist-info; do \
+                    cp -a "$d" /usr/local/lib/python3.10/site-packages/; \
+                  done; \
+                fi'
+
           # Repair VLM-compatible dependencies after copying API deps.
           RUN pip install --no-cache-dir --upgrade "huggingface-hub>=0.34.0,<1.0" && \
               pip install --no-cache-dir --force-reinstall "PyYAML==6.0.2"
@@ -280,7 +317,7 @@ jobs:
           COPY --from=triton_image /app/model_repo /workspace/triton-model-repository
 
           # Match upstream server.sh:
-          # for every model dir, if config.pbtxt is missing, promote config_gpu.pbtxt to config.pbtxt.
+          # for every model dir, if config.pbtxt is missing, promote config_gpu.pbtxt/config_cpu.pbtxt.
           RUN for dir in /workspace/triton-model-repository/*/ ; do \
                 [ -d "\$dir" ] || continue ; \
                 if [ ! -f "\${dir}/config.pbtxt" ]; then \
